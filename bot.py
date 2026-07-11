@@ -1,1 +1,1 @@
-# Bot-telegram-on-python
+nano requirements.txt
