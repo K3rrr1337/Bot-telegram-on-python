@@ -1,4 +1,4 @@
-# bot.py (полностью исправленная рабочая версия)
+# bot.py - Полностью исправленная версия с улучшениями
 import sqlite3
 import logging
 from datetime import datetime, timedelta
@@ -9,6 +9,10 @@ import os
 import random
 import string
 import ast
+import signal
+import sys
+import time
+import shutil
 
 # Настройка логирования
 logging.basicConfig(
@@ -25,6 +29,43 @@ try:
     ADMIN_IDS = ast.literal_eval(ADMIN_IDS_RAW)
 except:
     ADMIN_IDS = [1908250518]
+
+# --- ДОПОЛНИТЕЛЬНЫЕ ФУНКЦИИ ДЛЯ БЭКАПА ---
+def backup_database():
+    """Создает резервную копию базы данных"""
+    try:
+        backup_name = f"clamsi_bot_backup_{datetime.now().strftime('%Y%m%d_%H%M%S')}.db"
+        shutil.copy2('clamsi_bot.db', backup_name)
+        logger.info(f"Создан бэкап БД: {backup_name}")
+        
+        # Удаляем старые бэкапы (оставляем только 5 последних)
+        backups = sorted([f for f in os.listdir('.') if f.startswith('clamsi_bot_backup_')])
+        if len(backups) > 5:
+            for old_backup in backups[:-5]:
+                os.remove(old_backup)
+                logger.info(f"Удален старый бэкап: {old_backup}")
+    except Exception as e:
+        logger.error(f"Ошибка создания бэкапа: {e}")
+
+def safe_db_operation(func):
+    """Декоратор для безопасной работы с БД"""
+    def wrapper(*args, **kwargs):
+        try:
+            return func(*args, **kwargs)
+        except sqlite3.OperationalError as e:
+            logger.error(f"Ошибка БД в {func.__name__}: {e}")
+            time.sleep(1)
+            try:
+                return func(*args, **kwargs)
+            except:
+                logger.error(f"Повторная попытка в {func.__name__} также не удалась")
+                raise
+    return wrapper
+
+def signal_handler(signum, frame):
+    """Обработчик сигналов для корректного завершения"""
+    print("\n🛑 Бот завершает работу... Сохранение данных...")
+    sys.exit(0)
 
 # Инициализация базы данных
 def init_db():
@@ -125,6 +166,7 @@ def init_db():
     
     conn.commit()
     conn.close()
+    logger.info("База данных инициализирована")
 
 # Работа с БД - Пользователи
 def register_user(user_id, username, first_name, last_name):
@@ -187,7 +229,6 @@ def get_config_by_id(config_id):
     return config
 
 def add_config(name, description, price, price_type, file_path, photo_path=None):
-    # Проверка на пустые значения
     if not name or not name.strip():
         raise ValueError("Название товара не может быть пустым")
     
@@ -297,13 +338,11 @@ def use_promocode(user_id, promocode_id):
     conn = sqlite3.connect('clamsi_bot.db', timeout=10)
     cursor = conn.cursor()
     
-    # Проверяем, использовал ли пользователь уже этот промокод
     cursor.execute('SELECT id FROM used_promocodes WHERE user_id = ? AND promocode_id = ?', (user_id, promocode_id))
     if cursor.fetchone():
         conn.close()
         return False, "Вы уже использовали этот промокод"
     
-    # Проверяем лимиты
     cursor.execute('SELECT max_uses, used_count, coins FROM promocodes WHERE id = ?', (promocode_id,))
     max_uses, used_count, coins = cursor.fetchone()
     
@@ -311,7 +350,6 @@ def use_promocode(user_id, promocode_id):
         conn.close()
         return False, "Промокод больше не действителен"
     
-    # Используем промокод
     cursor.execute('UPDATE promocodes SET used_count = used_count + 1 WHERE id = ?', (promocode_id,))
     cursor.execute('INSERT INTO used_promocodes (user_id, promocode_id) VALUES (?, ?)', (user_id, promocode_id))
     cursor.execute('UPDATE users SET coins = coins + ? WHERE user_id = ?', (coins, user_id))
@@ -441,6 +479,21 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     reply_markup = InlineKeyboardMarkup(keyboard)
     await update.message.reply_text(welcome_text, reply_markup=reply_markup)
 
+async def backup(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Команда для создания бэкапа базы данных"""
+    if not is_admin(update.effective_user.id):
+        await update.message.reply_text("⛔ У вас нет доступа.")
+        return
+    
+    try:
+        backup_database()
+        await update.message.reply_text(
+            "✅ Резервная копия базы данных создана!\n"
+            "Файл сохранен в директории бота."
+        )
+    except Exception as e:
+        await update.message.reply_text(f"❌ Ошибка: {str(e)}")
+
 # Профиль пользователя
 async def profile(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -498,7 +551,6 @@ async def process_promocode(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     promocode_id, code, coins, is_active, max_uses, used_count, expires_at = promocode
     
-    # Проверяем срок действия
     if expires_at:
         expires_date = datetime.fromisoformat(expires_at)
         if datetime.now() > expires_date:
@@ -555,7 +607,6 @@ async def buy_config(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     config_id, name, description, price, price_type, file_path, photo_path = config
     
-    # Проверяем хватает ли монет
     user_id = update.effective_user.id
     coins = get_user_coins(user_id)
     
@@ -589,7 +640,6 @@ async def confirm_coin_purchase(update: Update, context: ContextTypes.DEFAULT_TY
     config_id, name, description, price, price_type, file_path, photo_path = config
     user_id = update.effective_user.id
     
-    # Проверяем баланс
     if not spend_coins(user_id, price):
         await query.edit_message_text(
             "❌ Недостаточно монет!\n\n"
@@ -601,13 +651,10 @@ async def confirm_coin_purchase(update: Update, context: ContextTypes.DEFAULT_TY
         )
         return
     
-    # Создаем заказ
     order_id = add_order(user_id, update.effective_user.username, config_id, name, price, 'coins')
     
-    # Отправляем конфиг
     await send_config_file(query, config, name)
     
-    # Оповещаем админов
     for admin_id in ADMIN_IDS:
         try:
             await context.bot.send_message(
@@ -624,7 +671,6 @@ async def confirm_coin_purchase(update: Update, context: ContextTypes.DEFAULT_TY
 async def send_config_file(query, config, name):
     config_id, name, description, price, price_type, file_path, photo_path = config
     
-    # Если есть фото - отправляем
     if photo_path and os.path.exists(photo_path):
         with open(photo_path, 'rb') as photo:
             await query.message.reply_photo(
@@ -638,7 +684,6 @@ async def send_config_file(query, config, name):
             f"Спасибо за покупку! ❤️"
         )
     
-    # Отправляем файл
     if os.path.exists(file_path):
         with open(file_path, 'rb') as f:
             await query.message.reply_document(
@@ -831,6 +876,7 @@ async def admin_panel(update: Update, context: ContextTypes.DEFAULT_TYPE):
         [InlineKeyboardButton("👥 Пользователи", callback_data='admin_users')],
         [InlineKeyboardButton("⚙️ Настройки", callback_data='admin_settings')],
         [InlineKeyboardButton("📊 Статистика", callback_data='admin_stats')],
+        [InlineKeyboardButton("💾 Бэкап БД", callback_data='admin_backup')],
         [InlineKeyboardButton("🔙 Назад", callback_data='back_to_main')]
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
@@ -840,6 +886,27 @@ async def admin_panel(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "Выберите раздел для управления:",
         reply_markup=reply_markup
     )
+
+async def admin_backup(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обработчик для кнопки бэкапа в админ-панели"""
+    query = update.callback_query
+    await query.answer()
+    
+    if not is_admin(update.effective_user.id):
+        await query.edit_message_text("⛔ У вас нет доступа.")
+        return
+    
+    try:
+        backup_database()
+        await query.edit_message_text(
+            "✅ Резервная копия базы данных создана!\n"
+            "Файл сохранен в директории бота.",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("🔙 Назад", callback_data='admin_panel')]
+            ])
+        )
+    except Exception as e:
+        await query.edit_message_text(f"❌ Ошибка: {str(e)}")
 
 # Управление товарами
 async def admin_configs(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -871,7 +938,6 @@ async def add_config_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_text("⛔ У вас нет доступа.")
         return
     
-    # Инициализация данных
     context.user_data['adding_config'] = True
     context.user_data['config_step'] = 'name'
     context.user_data['config_name'] = ''
@@ -1249,31 +1315,24 @@ async def admin_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
     conn = sqlite3.connect('clamsi_bot.db', timeout=10)
     cursor = conn.cursor()
     
-    # Количество пользователей
     cursor.execute('SELECT COUNT(*) FROM users')
     users_count = cursor.fetchone()[0]
     
-    # Количество заказов
     cursor.execute('SELECT COUNT(*) FROM orders')
     orders_count = cursor.fetchone()[0]
     
-    # Сумма продаж в монетах
     cursor.execute('SELECT SUM(price) FROM orders WHERE payment_type = "coins"')
     coins_revenue = cursor.fetchone()[0] or 0
     
-    # Количество конфигов
     cursor.execute('SELECT COUNT(*) FROM configs WHERE is_active = 1')
     configs_count = cursor.fetchone()[0]
     
-    # Количество открытых тикетов
     cursor.execute('SELECT COUNT(*) FROM support_tickets WHERE status = "open"')
     open_tickets = cursor.fetchone()[0]
     
-    # Количество промокодов
     cursor.execute('SELECT COUNT(*) FROM promocodes WHERE is_active = 1')
     promocodes_count = cursor.fetchone()[0]
     
-    # Всего монет в системе
     cursor.execute('SELECT SUM(coins) FROM users')
     total_coins = cursor.fetchone()[0] or 0
     
@@ -1326,16 +1385,13 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     text = update.message.text
     
-    # Обработка ответа на тикет от админа
     if context.user_data.get('answering_ticket'):
         ticket_id = context.user_data['answering_ticket']
         ticket = get_ticket_by_id(ticket_id)
         
         if ticket:
-            # Сохраняем ответ в БД
             update_ticket_response(ticket_id, text)
             
-            # Отправляем ответ пользователю
             try:
                 await context.bot.send_message(
                     ticket[1],
@@ -1358,13 +1414,11 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text("❌ Обращение не найдено.")
         return
     
-    # Обработка промокода
     if context.user_data.get('awaiting_promo'):
         context.user_data['awaiting_promo'] = False
         await process_promocode(update, context)
         return
     
-    # Обработка сообщения в поддержку
     if context.user_data.get('support_mode') == 'write':
         ticket_id = create_support_ticket(
             user.id,
@@ -1393,7 +1447,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.user_data['support_mode'] = None
         return
     
-    # Обработка добавления товара
     if context.user_data.get('adding_config'):
         step = context.user_data.get('config_step')
         
@@ -1434,7 +1487,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 context.user_data['config_step'] = 'file'
                 await update.message.reply_text("📎 Отправьте файл товара:")
             elif update.message.photo:
-                # Сохраняем фото
                 if not os.path.exists('configs'):
                     os.makedirs('configs')
                 
@@ -1460,21 +1512,18 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 new_file = await file.get_file()
                 await new_file.download_to_drive(file_path)
                 
-                # Проверяем, что название не пустое
                 config_name = context.user_data.get('config_name')
                 if not config_name or not config_name.strip():
                     await update.message.reply_text("❌ Ошибка: название товара не было введено!")
                     context.user_data.clear()
                     return
                 
-                # Проверяем цену
                 config_price = context.user_data.get('config_price', 0)
                 if config_price <= 0:
                     await update.message.reply_text("❌ Ошибка: цена должна быть больше 0!")
                     context.user_data.clear()
                     return
                 
-                # Сохраняем товар
                 try:
                     config_id = add_config(
                         config_name.strip(),
@@ -1499,7 +1548,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await update.message.reply_text("❌ Пожалуйста, отправьте файл.")
         return
     
-    # Обработка создания промокода
     if context.user_data.get('creating_promo'):
         step = context.user_data.get('promo_step')
         
@@ -1537,7 +1585,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             try:
                 expires_days = int(text) if int(text) > 0 else None
                 
-                # Создаем промокод
                 code, promo_id = create_promocode(
                     context.user_data['promo_coins'],
                     update.effective_user.id,
@@ -1562,7 +1609,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await update.message.reply_text("❌ Введите корректное число дней.")
         return
     
-    # Редактирование настроек
     if context.user_data.get('editing_setting'):
         setting_key = context.user_data['editing_setting']
         set_setting(setting_key, text)
@@ -1576,12 +1622,21 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
     
-    # Если сообщение не относится ни к чему
     await start(update, context)
 
 def main():
     # Инициализация БД
     init_db()
+    
+    # Создаем бэкап при старте
+    try:
+        backup_database()
+    except:
+        pass
+    
+    # Регистрируем обработчики сигналов
+    signal.signal(signal.SIGINT, signal_handler)
+    signal.signal(signal.SIGTERM, signal_handler)
     
     # Создаем приложение
     application = Application.builder().token(TOKEN).build()
@@ -1589,6 +1644,7 @@ def main():
     # Регистрируем обработчики команд
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("skip", lambda u, c: None))
+    application.add_handler(CommandHandler("backup", backup))
     
     # Обработчики callback-запросов
     application.add_handler(CallbackQueryHandler(catalog, pattern='^catalog$'))
@@ -1603,6 +1659,7 @@ def main():
     application.add_handler(CallbackQueryHandler(admin_tickets, pattern='^admin_tickets$'))
     application.add_handler(CallbackQueryHandler(answer_ticket, pattern='^answer_ticket_'))
     application.add_handler(CallbackQueryHandler(admin_panel, pattern='^admin_panel$'))
+    application.add_handler(CallbackQueryHandler(admin_backup, pattern='^admin_backup$'))
     application.add_handler(CallbackQueryHandler(admin_configs, pattern='^admin_configs$'))
     application.add_handler(CallbackQueryHandler(add_config_start, pattern='^add_config$'))
     application.add_handler(CallbackQueryHandler(list_configs, pattern='^list_configs$'))
@@ -1626,7 +1683,21 @@ def main():
     
     # Запускаем бота
     print("🤖 Бот запущен!")
-    application.run_polling(allowed_updates=Update.ALL_TYPES)
+    print("📍 Для остановки нажмите Ctrl+C")
+    print(f"👑 Администраторы: {ADMIN_IDS}")
+    
+    try:
+        application.run_polling(allowed_updates=Update.ALL_TYPES)
+    except KeyboardInterrupt:
+        print("\n🛑 Бот остановлен пользователем")
+    finally:
+        # Закрываем все соединения с БД
+        try:
+            conn = sqlite3.connect('clamsi_bot.db')
+            conn.close()
+        except:
+            pass
+        print("✅ Все данные сохранены. До свидания!")
 
 if __name__ == '__main__':
     main()
